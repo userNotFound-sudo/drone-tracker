@@ -1,6 +1,8 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 
+const BACKEND_WS_URL = 'ws://127.0.0.1:8000/ws/tracks'
+
 function clamp(n, a, b){ return Math.max(a, Math.min(b, n)) }
 function fmt(n, d=0){ return (n===null||n===undefined||Number.isNaN(n)) ? '—' : n.toFixed(d) }
 
@@ -82,6 +84,7 @@ export default function App(){
   const [alertsOnly, setAlertsOnly] = useState(false)
   const [showVectors, setShowVectors] = useState(true)
   const [rings, setRings] = useState(5)
+  const [wsTracks, setWsTracks] = useState(null)
 
   const timerRef = useRef(null)
 
@@ -92,12 +95,31 @@ export default function App(){
     return ()=> clearInterval(timerRef.current)
   }, [playing, speed])
 
+  useEffect(()=>{
+    const ws = new WebSocket(BACKEND_WS_URL)
+    ws.onmessage = (event) => {
+      let msg
+      try { msg = JSON.parse(event.data) } catch { return }
+      if (msg?.type === 'tracks_snapshot' && Array.isArray(msg.tracks)) {
+        setWsTracks(msg.tracks)
+      }
+    }
+    ws.onclose = () => setWsTracks(null)
+    ws.onerror = () => ws.close()
+    return () => {
+      ws.onclose = null
+      ws.close()
+      setWsTracks(null)
+    }
+  }, [])
+
   const t = Date.now() + tick*120
   const tracks = useMemo(()=>{
+    if (wsTracks) return wsTracks
     const list = []
     for (let i=1;i<=72;i++) list.push(makeTrack(i, t))
     return list
-  }, [t])
+  }, [t, wsTracks])
 
   const clusters = useMemo(()=>groupClusters(tracks), [tracks])
   const selected = useMemo(()=> tracks.find(x=>x.id===selectedId) || null, [tracks, selectedId])
