@@ -2,13 +2,15 @@ import asyncio
 import math
 import os
 import pathlib
+import time
 
 import cv2
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .altitude import AltitudeEstimator, load_config
+from .db import TrackSampleWriter, get_connection, init_db
 from .detector import BlobDetector, YoloDetector
 from .tracker import MultiObjectTracker
 
@@ -27,6 +29,8 @@ app.add_middleware(
 _current_tracks: list[dict] = []
 _current_media_t_sec: float = 0.0
 _frame_meta: dict = {"frame_w": 1024, "frame_h": 576, "fps": 30}
+
+_writer = TrackSampleWriter()
 
 
 def _pixel_to_radar(cx, cy, frame_w, frame_h):
@@ -123,6 +127,7 @@ async def _video_pipeline():
             print(f"[pipeline] altitude estimator failed: {e}")
 
     frame_delay = 1.0 / fps
+    sample_every = max(1, round(fps / 10.0))  # record at ~10 Hz
     frame_index = 0
 
     while True:
@@ -137,6 +142,21 @@ async def _video_pipeline():
         detections = detector.detect(frame)
         tracks = tracker.update(detections)
         _current_tracks = [_build_track(t, frame_w, frame_h, fps, alt_est) for t in tracks]
+
+        if frame_index % sample_every == 0:
+            ts_ms = int(time.time() * 1000)
+            for t in _current_tracks:
+                _writer.add_sample({
+                    "ts_ms":       ts_ms,
+                    "track_id":    t["id"],
+                    "bearing":     t["bearing"],
+                    "range_u":     t["range_u"],
+                    "heading":     t["heading"],
+                    "rel_speed_u": t["rel_speed_u"],
+                    "altitude_m":  t["altitude_m"],
+                    "confidence":  t["confidence"],
+                })
+
         frame_index += 1
 
         await asyncio.sleep(frame_delay)
@@ -144,7 +164,14 @@ async def _video_pipeline():
 
 @app.on_event("startup")
 async def startup():
+    init_db()
+    _writer.start()
     asyncio.create_task(_video_pipeline())
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    _writer.stop()
 
 
 @app.get("/health")
@@ -157,6 +184,140 @@ def video():
     if not VIDEO_PATH.exists():
         raise HTTPException(status_code=404, detail="Video file not found")
     return FileResponse(str(VIDEO_PATH), media_type="video/mp4")
+
+
+_MAX_REPLAY_MS = 10 * 60 * 1000  # 10 minutes
+
+
+@app.get("/replay")
+def replay(
+    start_ms: int = Query(...),
+    end_ms: int = Query(...),
+    limit: int = Query(1000),
+):
+    if start_ms >= end_ms:
+        raise HTTPException(status_code=400, detail="start_ms must be less than end_ms")
+    if end_ms - start_ms > _MAX_REPLAY_MS:
+        raise HTTPException(status_code=400, detail="Time range exceeds maximum of 10 minutes (600 000 ms)")
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 20000")
+
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT ts_ms, track_id, bearing, range_u, heading, rel_speed_u, altitude_m, confidence"
+            " FROM track_samples"
+            " WHERE ts_ms >= ? AND ts_ms <= ?"
+            " ORDER BY ts_ms"
+            " LIMIT ?",
+            (start_ms, end_ms, limit),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    return {"count": len(rows), "rows": rows}
+
+
+_MIN_RATE = 0.1
+_MAX_RATE = 10.0
+_MIN_HZ   = 1.0
+_MAX_HZ   = 30.0
+
+
+def _replay_track(row: dict) -> dict:
+    """Reconstruct a frontend-compatible track dict from a stored DB row."""
+    track_id = row["track_id"]
+    range_u  = row["range_u"] or 0.5
+    return {
+        "id":          track_id,
+        "callsign":    f"UAV-{track_id:02d}",
+        "type":        "unknown",
+        "bearing":     row["bearing"],
+        "range_u":     range_u,
+        "heading":     row["heading"],
+        "rel_speed_u": row["rel_speed_u"],
+        "alt_band":    _alt_band(range_u),
+        "confidence":  row["confidence"],
+        "flags":       [],
+        "altitude_m":  row["altitude_m"],
+    }
+
+
+@app.websocket("/ws/replay")
+async def ws_replay(
+    websocket: WebSocket,
+    start_ms: int   = Query(...),
+    end_ms:   int   = Query(...),
+    rate:     float = Query(1.0),
+    hz:       float = Query(10.0),
+):
+    await websocket.accept()
+
+    errors = []
+    if start_ms >= end_ms:
+        errors.append("start_ms must be less than end_ms")
+    if end_ms - start_ms > _MAX_REPLAY_MS:
+        errors.append("time range exceeds 10 minutes")
+    if not (_MIN_RATE <= rate <= _MAX_RATE):
+        errors.append(f"rate must be {_MIN_RATE}–{_MAX_RATE}")
+    if not (_MIN_HZ <= hz <= _MAX_HZ):
+        errors.append(f"hz must be {_MIN_HZ}–{_MAX_HZ}")
+
+    if errors:
+        await websocket.send_json({"type": "error", "detail": "; ".join(errors)})
+        await websocket.close(code=4400)
+        return
+
+    # Load and group all rows by timestamp up front (max ~10 min × 10 Hz × N tracks)
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT ts_ms, track_id, bearing, range_u, heading, rel_speed_u, altitude_m, confidence"
+            " FROM track_samples"
+            " WHERE ts_ms >= ? AND ts_ms <= ?"
+            " ORDER BY ts_ms",
+            (start_ms, end_ms),
+        )
+        cols = [d[0] for d in cur.description]
+        raw_rows = cur.fetchall()
+
+    frames: dict[int, list[dict]] = {}
+    for row in raw_rows:
+        r = dict(zip(cols, row))
+        frames.setdefault(r["ts_ms"], []).append(r)
+
+    timestamps = sorted(frames)
+
+    if not timestamps:
+        await websocket.send_json({"type": "done", "count": 0})
+        await websocket.close()
+        return
+
+    # Replay: advance a cursor through the timeline at `rate` speed, ticking at `hz`
+    tick_s      = 1.0 / hz
+    advance_ms  = rate * (1000.0 / hz)   # ms of recorded time covered per tick
+    cursor_ms   = float(start_ms)
+    ts_idx      = 0
+
+    try:
+        while cursor_ms <= end_ms:
+            # Move frame pointer forward to the last stored timestamp <= cursor
+            while ts_idx + 1 < len(timestamps) and timestamps[ts_idx + 1] <= cursor_ms:
+                ts_idx += 1
+
+            current_ts = timestamps[ts_idx]
+            await websocket.send_json({
+                "type":        "tracks_snapshot",
+                "media_t_sec": (current_ts - start_ms) / 1000.0,
+                "tracks":      [_replay_track(r) for r in frames[current_ts]],
+            })
+
+            cursor_ms += advance_ms
+            await asyncio.sleep(tick_s)
+
+        await websocket.send_json({"type": "done", "count": len(timestamps)})
+        await websocket.close()
+
+    except Exception:
+        pass  # client disconnected mid-replay
 
 
 @app.websocket("/ws/tracks")

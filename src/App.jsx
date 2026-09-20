@@ -1,7 +1,9 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { useLocalStorage } from './useLocalStorage'
 
-const BACKEND_WS_URL = 'ws://127.0.0.1:8000/ws/tracks'
+const LIVE_WS_URL = 'ws://127.0.0.1:8001/ws/tracks'
+const REPLAY_WS_BASE = 'ws://127.0.0.1:8001/ws/replay'
 
 function clamp(n, a, b){ return Math.max(a, Math.min(b, n)) }
 function fmt(n, d=0){ return (n===null||n===undefined||Number.isNaN(n)) ? '—' : n.toFixed(d) }
@@ -74,18 +76,31 @@ function nowTS(){
   return d.toISOString().slice(11,19)
 }
 
+function toLocalDt(ms) {
+  const d = new Date(ms)
+  const p = n => String(n).padStart(2,'0')
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 export default function App(){
   const [playing, setPlaying] = useState(true)
   const [speed, setSpeed] = useState(1)
   const [tick, setTick] = useState(0)
   const [selectedId, setSelectedId] = useState(7)
-  const [notesById, setNotesById] = useState({})
+  const [notesById, setNotesById] = useLocalStorage('commander-notes', {})
   const [search, setSearch] = useState('')
   const [alertsOnly, setAlertsOnly] = useState(false)
   const [showVectors, setShowVectors] = useState(true)
   const [rings, setRings] = useState(5)
   const [wsTracks, setWsTracks] = useState(null)
   const [syncedTracks, setSyncedTracks] = useState(null)
+  const [mode, setMode] = useState('live')
+  const [replayForm, setReplayForm] = useState(() => {
+    const now = Date.now()
+    return { startDt: toLocalDt(now - 5*60*1000), endDt: toLocalDt(now), rate: '1', hz: '10' }
+  })
+  const [wsUrl, setWsUrl] = useState(LIVE_WS_URL)
+  const [replayStatus, setReplayStatus] = useState('')
 
   const timerRef      = useRef(null)
   const videoRef      = useRef(null)
@@ -103,20 +118,25 @@ export default function App(){
 
   useEffect(()=>{
     const BUFFER_SECS = 60
-    const ws = new WebSocket(BACKEND_WS_URL)
+    setReplayStatus(s => s === '' ? '' : s)  // don't clear error on reconnect
+    const ws = new WebSocket(wsUrl)
     ws.onmessage = (event) => {
       let msg
       try { msg = JSON.parse(event.data) } catch { return }
       if (msg?.type === 'tracks_snapshot' && Array.isArray(msg.tracks)) {
         setWsTracks(msg.tracks)
-        // buffer by timestamp for canvas overlay
         const t = msg.media_t_sec ?? 0
         frameBuffer.current.set(t, msg.tracks)
-        // evict entries older than BUFFER_SECS
         for (const k of frameBuffer.current.keys()) {
           if (k < t - BUFFER_SECS) frameBuffer.current.delete(k)
           else break
         }
+      } else if (msg?.type === 'done') {
+        setReplayStatus(`Done · ${msg.count} frames replayed`)
+        setWsTracks(null)
+      } else if (msg?.type === 'error') {
+        setReplayStatus(`Error: ${msg.detail}`)
+        setWsTracks(null)
       }
     }
     ws.onclose = () => setWsTracks(null)
@@ -126,7 +146,7 @@ export default function App(){
       ws.close()
       setWsTracks(null)
     }
-  }, [])
+  }, [wsUrl])
 
   // canvas bbox overlay — runs every animation frame
   useEffect(()=>{
@@ -199,12 +219,12 @@ export default function App(){
 
   const t = Date.now() + tick*120
   const tracks = useMemo(()=>{
-    if (syncedTracks) return syncedTracks   // video timeline is authoritative
-    if (wsTracks) return wsTracks           // backend live but video not started
+    if (mode === 'live' && syncedTracks) return syncedTracks  // video timeline is authoritative (live only)
+    if (wsTracks) return wsTracks
     const list = []
     for (let i=1;i<=72;i++) list.push(makeTrack(i, t))
     return list
-  }, [t, syncedTracks, wsTracks])
+  }, [mode, t, syncedTracks, wsTracks])
 
   const clusters = useMemo(()=>groupClusters(tracks), [tracks])
   const selected = useMemo(()=> tracks.find(x=>x.id===selectedId) || null, [tracks, selectedId])
@@ -235,6 +255,33 @@ export default function App(){
     rows.push({ ts: nowTS(), msg: `Mode: Relative range units + inferred altitude bands (no telemetry)` })
     return rows
   }, [tracks, clusters, alertCount])
+
+  function switchToLive() {
+    frameBuffer.current.clear()
+    setSyncedTracks(null)
+    lastSyncKey.current = null
+    setReplayStatus('')
+    setMode('live')
+    setWsUrl(LIVE_WS_URL)
+  }
+
+  function startReplay() {
+    const startMs = new Date(replayForm.startDt).getTime()
+    const endMs   = new Date(replayForm.endDt).getTime()
+    const rate    = parseFloat(replayForm.rate)
+    const hz      = parseFloat(replayForm.hz)
+    if (!replayForm.startDt || !replayForm.endDt || isNaN(startMs) || isNaN(endMs) || startMs >= endMs)
+      return setReplayStatus('Error: start must be before end')
+    if (isNaN(rate) || rate < 0.1 || rate > 10)
+      return setReplayStatus('Error: rate must be 0.1 – 10')
+    if (isNaN(hz) || hz < 1 || hz > 30)
+      return setReplayStatus('Error: hz must be 1 – 30')
+    frameBuffer.current.clear()
+    setSyncedTracks(null)
+    lastSyncKey.current = null
+    setReplayStatus('Connecting…')
+    setWsUrl(`${REPLAY_WS_BASE}?start_ms=${startMs}&end_ms=${endMs}&rate=${rate}&hz=${hz}`)
+  }
 
   const rewind = ()=> setTick(v=> Math.max(0, v-12))
   const stepBack = ()=> setTick(v=> Math.max(0, v-1))
@@ -308,7 +355,7 @@ export default function App(){
             <div className="videoBox" style={{ position: 'relative' }}>
               <video
                 ref={videoRef}
-                src="http://127.0.0.1:8000/video"
+                src="http://127.0.0.1:8001/video"
                 controls
                 style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: 12 }}
               />
@@ -339,6 +386,48 @@ export default function App(){
           </div>
 
           <div className="panelBody" style={{ overflow:'hidden' }}>
+            {/* Data source selector */}
+            <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:8, flexWrap:'wrap' }}>
+              <button className={`btn${mode==='live'?' primary':''}`} onClick={switchToLive}>LIVE</button>
+              <button className={`btn${mode==='replay'?' primary':''}`} onClick={()=>setMode('replay')}>REPLAY</button>
+              {mode === 'replay' && (<>
+                <input
+                  type="datetime-local"
+                  className="select"
+                  style={{ flex:1, minWidth:140 }}
+                  value={replayForm.startDt}
+                  onChange={e=>setReplayForm(f=>({...f, startDt:e.target.value}))}
+                />
+                <input
+                  type="datetime-local"
+                  className="select"
+                  style={{ flex:1, minWidth:140 }}
+                  value={replayForm.endDt}
+                  onChange={e=>setReplayForm(f=>({...f, endDt:e.target.value}))}
+                />
+                <input
+                  type="number"
+                  className="select"
+                  style={{ width:56 }}
+                  placeholder="Rate"
+                  min="0.1" max="10" step="0.1"
+                  value={replayForm.rate}
+                  onChange={e=>setReplayForm(f=>({...f, rate:e.target.value}))}
+                />
+                <input
+                  type="number"
+                  className="select"
+                  style={{ width:50 }}
+                  placeholder="Hz"
+                  min="1" max="30"
+                  value={replayForm.hz}
+                  onChange={e=>setReplayForm(f=>({...f, hz:e.target.value}))}
+                />
+                <button className="btn primary" onClick={startReplay}>▶</button>
+              </>)}
+              {replayStatus && <span className="small" style={{ color: replayStatus.startsWith('Error') ? 'rgba(239,68,68,.9)' : undefined }}>{replayStatus}</span>}
+            </div>
+
             <div className="radarWrap">
               <svg className="radarSvg" viewBox={`0 0 ${W} ${H}`}>
                 {/* Base circle + rings */}
