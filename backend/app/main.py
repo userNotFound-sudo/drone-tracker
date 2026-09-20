@@ -4,8 +4,9 @@ import pathlib
 import time
 
 import cv2
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from .detector import BlobDetector
 from .tracker import MultiObjectTracker
@@ -116,6 +117,13 @@ async def startup():
 @app.get("/health")
 def health():
     return {"ok": True}
+
+
+@app.get("/video")
+def video():
+    if not VIDEO_PATH.exists():
+        raise HTTPException(status_code=404, detail="Video file not found")
+    return FileResponse(str(VIDEO_PATH), media_type="video/mp4")
 
 
 @app.websocket("/ws/tracks")
