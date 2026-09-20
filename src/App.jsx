@@ -85,8 +85,14 @@ export default function App(){
   const [showVectors, setShowVectors] = useState(true)
   const [rings, setRings] = useState(5)
   const [wsTracks, setWsTracks] = useState(null)
+  const [syncedTracks, setSyncedTracks] = useState(null)
 
-  const timerRef = useRef(null)
+  const timerRef      = useRef(null)
+  const videoRef      = useRef(null)
+  const canvasRef     = useRef(null)
+  const frameBuffer   = useRef(new Map())  // media_t_sec -> tracks[]
+  const rafRef        = useRef(null)
+  const lastSyncKey   = useRef(null)
 
   useEffect(()=>{
     clearInterval(timerRef.current)
@@ -96,12 +102,21 @@ export default function App(){
   }, [playing, speed])
 
   useEffect(()=>{
+    const BUFFER_SECS = 60
     const ws = new WebSocket(BACKEND_WS_URL)
     ws.onmessage = (event) => {
       let msg
       try { msg = JSON.parse(event.data) } catch { return }
       if (msg?.type === 'tracks_snapshot' && Array.isArray(msg.tracks)) {
         setWsTracks(msg.tracks)
+        // buffer by timestamp for canvas overlay
+        const t = msg.media_t_sec ?? 0
+        frameBuffer.current.set(t, msg.tracks)
+        // evict entries older than BUFFER_SECS
+        for (const k of frameBuffer.current.keys()) {
+          if (k < t - BUFFER_SECS) frameBuffer.current.delete(k)
+          else break
+        }
       }
     }
     ws.onclose = () => setWsTracks(null)
@@ -113,13 +128,83 @@ export default function App(){
     }
   }, [])
 
+  // canvas bbox overlay — runs every animation frame
+  useEffect(()=>{
+    const draw = () => {
+      rafRef.current = requestAnimationFrame(draw)
+      const video  = videoRef.current
+      const canvas = canvasRef.current
+      if (!video || !canvas) return
+
+      const dw = canvas.offsetWidth
+      const dh = canvas.offsetHeight
+      if (canvas.width !== dw || canvas.height !== dh) {
+        canvas.width  = dw
+        canvas.height = dh
+      }
+
+      const ctx = canvas.getContext('2d')
+      ctx.clearRect(0, 0, dw, dh)
+
+      const buf = frameBuffer.current
+      if (buf.size === 0) return
+
+      // find buffered frame closest to video.currentTime
+      const ct = video.currentTime
+      let bestKey = null
+      let bestDiff = Infinity
+      for (const k of buf.keys()) {
+        const d = Math.abs(k - ct)
+        if (d < bestDiff) { bestDiff = d; bestKey = k }
+      }
+      if (bestKey === null) return
+
+      // promote to React state only when the frame actually changes
+      if (bestKey !== lastSyncKey.current) {
+        lastSyncKey.current = bestKey
+        setSyncedTracks(buf.get(bestKey))
+      }
+
+      const tracks = buf.get(bestKey)
+      const srcW = video.videoWidth  || 1280
+      const srcH = video.videoHeight || 720
+      const scaleX = dw / srcW
+      const scaleY = dh / srcH
+
+      ctx.lineWidth   = 1.5
+      ctx.font        = '10px monospace'
+      ctx.textBaseline = 'top'
+
+      for (const tr of tracks) {
+        if (!tr.bbox) continue
+        const [x1, y1, x2, y2] = tr.bbox
+        const rx = x1 * scaleX
+        const ry = y1 * scaleY
+        const rw = (x2 - x1) * scaleX
+        const rh = (y2 - y1) * scaleY
+
+        const color = tr.flags?.includes('LOST')     ? 'rgba(239,68,68,.9)'
+                    : tr.flags?.includes('OCCLUDED') ? 'rgba(245,158,11,.9)'
+                    : 'rgba(34,197,94,.9)'
+
+        ctx.strokeStyle = color
+        ctx.strokeRect(rx, ry, rw, rh)
+        ctx.fillStyle = color
+        ctx.fillText(tr.callsign, rx + 2, ry + 2)
+      }
+    }
+    rafRef.current = requestAnimationFrame(draw)
+    return () => cancelAnimationFrame(rafRef.current)
+  }, [])
+
   const t = Date.now() + tick*120
   const tracks = useMemo(()=>{
-    if (wsTracks) return wsTracks
+    if (syncedTracks) return syncedTracks   // video timeline is authoritative
+    if (wsTracks) return wsTracks           // backend live but video not started
     const list = []
     for (let i=1;i<=72;i++) list.push(makeTrack(i, t))
     return list
-  }, [t, wsTracks])
+  }, [t, syncedTracks, wsTracks])
 
   const clusters = useMemo(()=>groupClusters(tracks), [tracks])
   const selected = useMemo(()=> tracks.find(x=>x.id===selectedId) || null, [tracks, selectedId])
@@ -220,35 +305,21 @@ export default function App(){
           </div>
 
           <div className="panelBody">
-            <div className="videoBox">
-              <div className="gridNoise" />
-              <div className="hud">
-                <div className="tag tagTL"><b>HUD</b> • IDs • Conf • Flags</div>
-                <div className="tag tagTR"><b>INTEGRITY</b> • no false precision</div>
-                <div className="tag tagBL"><b>NOTE</b> • range units + altitude bands are inferred</div>
-              </div>
-            </div>
-
-            <div className="controlsRow">
-              <button className="btn primary" onClick={()=>setPlaying(p=>!p)}>{playing ? 'Pause' : 'Play'}</button>
-              <button className="btn" onClick={stepBack}>Step -1</button>
-              <button className="btn" onClick={stepFwd}>Step +1</button>
-              <button className="btn" onClick={rewind}>-12</button>
-              <button className="btn" onClick={fastFwd}>+12</button>
-
-              <select className="select" value={speed} onChange={(e)=>setSpeed(Number(e.target.value))}>
-                <option value={0.5}>0.5×</option>
-                <option value={1}>1×</option>
-                <option value={2}>2×</option>
-                <option value={4}>4×</option>
-              </select>
-
-              <div className="small">Playback • T+ {tick}s</div>
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              <input className="range" type="range" min="0" max="600" value={tick} onChange={(e)=>setTick(Number(e.target.value))} />
-              <div className="small">Timeline scrub • deterministic simulation</div>
+            <div className="videoBox" style={{ position: 'relative' }}>
+              <video
+                ref={videoRef}
+                src="http://127.0.0.1:8000/video"
+                controls
+                style={{ width: '100%', height: '100%', objectFit: 'contain', borderRadius: 12 }}
+              />
+              <canvas
+                ref={canvasRef}
+                style={{
+                  position: 'absolute', top: 0, left: 0,
+                  width: '100%', height: '100%',
+                  pointerEvents: 'none', borderRadius: 12,
+                }}
+              />
             </div>
           </div>
         </div>

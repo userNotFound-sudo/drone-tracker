@@ -1,0 +1,15 @@
+{
+  "camera_lat": 35.60,
+  "camera_lon": -117.68,
+  "camera_height_m": 150,
+  "v_fov_deg": 45,
+  "max_range_m": 1000,
+  "landmarks": [
+    {
+      "name": "distant_ridgeline",
+      "pixel_y": 340,
+      "elevation_m": 180,
+      "distance_m": 1800
+    }
+  ]
+}

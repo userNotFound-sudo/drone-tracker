@@ -39,6 +39,23 @@ def _contours_to_boxes(mask, conf):
     return boxes
 
 
+class YoloDetector:
+    def __init__(self, model_path="yolov8n.pt", conf_thresh=0.12):
+        from ultralytics import YOLO
+        self._model = YOLO(model_path)
+        self._conf = conf_thresh
+
+    def detect(self, frame_bgr):
+        results = self._model(frame_bgr, conf=self._conf, verbose=False)
+        boxes = []
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+                conf = float(box.conf[0])
+                boxes.append((x1, y1, x2, y2, conf))
+        return boxes
+
+
 class BlobDetector:
     def __init__(self):
         self._kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
