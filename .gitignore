@@ -24,3 +24,6 @@ __pycache__/
 
 # Backend data directory — JSON files may contain sensitive location config
 backend/data/*.json
+
+# Claude Code local settings (machine-specific paths)
+.claude/settings.local.json
