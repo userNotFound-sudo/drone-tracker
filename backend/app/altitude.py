@@ -44,7 +44,7 @@ def _in(value, lo, hi, name):
 
 
 def load_config(path=CONFIG_PATH):
-    with open(path) as f:
+    with open(path, encoding='utf-8') as f:
         cfg = json.load(f)
 
     _in(cfg["camera_lat"],    *_LAT_RANGE,    "camera_lat")

@@ -9,6 +9,11 @@ dist/
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# Credentials and certificates
+*.pem
+*.key
 
 # Large/binary assets — keep these out of git regardless of where they live
 *.mp4
@@ -16,3 +21,6 @@ __pycache__/
 *.db-wal
 *.db-shm
 *.pt
+
+# Backend data directory — JSON files may contain sensitive location config
+backend/data/*.json

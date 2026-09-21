@@ -326,15 +326,16 @@ export default function App(){
       fetch(`${BASE}/events?start_ms=${startMs}&end_ms=${endMs}&limit=20000`),
     ])
 
-    async function safeJson(settled, fallback) {
-      if (settled.status !== 'fulfilled' || !settled.value.ok) return fallback
-      try { return await settled.value.json() } catch { return fallback }
+    const failures = []
+    async function safeJson(settled, fallback, label) {
+      if (settled.status !== 'fulfilled' || !settled.value.ok) { failures.push(label); return fallback }
+      try { return await settled.value.json() } catch { failures.push(label); return fallback }
     }
 
     const [trackData, zonesData, eventsData] = await Promise.all([
-      safeJson(trackRes,  { count: 0, rows: [] }),
-      safeJson(zonesRes,  []),
-      safeJson(eventsRes, { count: 0, events: [] }),
+      safeJson(trackRes,  { count: 0, rows: [] }, 'tracks'),
+      safeJson(zonesRes,  [], 'zones'),
+      safeJson(eventsRes, { count: 0, events: [] }, 'events'),
     ])
 
     const aar = {
@@ -371,6 +372,10 @@ export default function App(){
     a.click()
     document.body.removeChild(a)
     URL.revokeObjectURL(url)
+
+    if (failures.length > 0) {
+      alert(`AAR export may be incomplete — failed sources: ${failures.join(', ')}`)
+    }
   }
 
   const rewind = ()=> setTick(v=> Math.max(0, v-12))
@@ -428,8 +433,16 @@ export default function App(){
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: name.trim(), shape: 'rectangle', coords }),
     })
-      .then(r => { if (r.ok) fetchZones() })
-      .catch(() => {})
+      .then(r => {
+        if (r.ok) {
+          fetchZones()
+        } else {
+          r.json()
+            .then(d => alert(`Zone save failed: ${d.detail ?? r.status}`))
+            .catch(() => alert(`Zone save failed (HTTP ${r.status})`))
+        }
+      })
+      .catch(err => alert(`Zone save failed: ${err.message}`))
   }
 
   const ringEls = []

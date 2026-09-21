@@ -91,6 +91,10 @@ class ZoneEventEngine:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def reset(self) -> None:
+        """Clear all track-zone state. Call when track IDs are reassigned (e.g. video loop)."""
+        self._state.clear()
+
     @staticmethod
     def _make(event_type: str, track_id: int, zone_id: int, ts_ms: int) -> dict:
         return {

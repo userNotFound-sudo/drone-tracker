@@ -5,12 +5,13 @@ import os
 import pathlib
 import re
 import time
+from typing import Annotated
 
 import cv2
-from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .altitude import AltitudeEstimator, load_config
 from .db import TrackSampleWriter, get_connection, init_db
@@ -26,7 +27,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
 # shared state written by the pipeline task, read by WebSocket clients
@@ -38,19 +39,23 @@ _writer        = TrackSampleWriter()
 _zone_engine   = ZoneEventEngine()
 _current_zones: list[dict] = []   # in-memory zone cache, refreshed on every write
 _pending_events: list[dict] = []  # events queued for the next WS send
+_MAX_PENDING_EVENTS = 1_000       # cap to prevent unbounded growth when no client is connected
 
 
 def _refresh_zones() -> None:
     global _current_zones
-    with get_connection() as conn:
-        cur = conn.execute(
-            "SELECT id, name, shape, coords FROM zones ORDER BY id"
-        )
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-    for row in rows:
-        row["coords"] = json.loads(row["coords"])
-    _current_zones = rows
+    try:
+        with get_connection() as conn:
+            cur = conn.execute(
+                "SELECT id, name, shape, coords FROM zones ORDER BY id"
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for row in rows:
+            row["coords"] = json.loads(row["coords"])
+        _current_zones = rows
+    except Exception as exc:
+        print(f"[zones] refresh failed, keeping cached list: {exc}")
 
 
 # Radar SVG constants — must match App.jsx (W=680, H=520, radius = min(W,H)/2 - 28)
@@ -172,6 +177,7 @@ async def _video_pipeline():
         if not ok:
             cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             tracker = MultiObjectTracker()   # reset IDs on loop
+            _zone_engine.reset()             # clear stale (track_id, zone_id) state before IDs reuse
             frame_index = 0
             continue
 
@@ -192,7 +198,9 @@ async def _video_pipeline():
             if track_points:
                 zone_events = _zone_engine.update(track_points, _current_zones, ts_ms)
                 if zone_events:
-                    _pending_events.extend(zone_events)
+                    remaining = _MAX_PENDING_EVENTS - len(_pending_events)
+                    if remaining > 0:
+                        _pending_events.extend(zone_events[:remaining])
                     with get_connection() as conn:
                         conn.executemany(
                             "INSERT INTO events (zone_id, ts_ms, event_type, track_id)"
@@ -250,7 +258,7 @@ _MAX_REPLAY_MS = 10 * 60 * 1000  # 10 minutes
 # Zones
 # ---------------------------------------------------------------------------
 
-_CTRL_RE   = re.compile(r'[\x00-\x1f\x7f]')
+_CTRL_RE   = re.compile(r'[\x00-\x1f\x7f​-‏‪-‮  ﻿]')
 _SHAPES    = {'rectangle', 'polygon'}
 _MAX_VERTS = 256
 _MAX_NAME  = 128
@@ -259,7 +267,7 @@ _MAX_NAME  = 128
 class ZoneCreate(BaseModel):
     name:   str
     shape:  str
-    coords: list[list[float]]
+    coords: Annotated[list[list[float]], Field(max_length=_MAX_VERTS)]
 
 
 def _validate_zone(z: ZoneCreate) -> tuple[str, str]:
@@ -267,10 +275,19 @@ def _validate_zone(z: ZoneCreate) -> tuple[str, str]:
     if not name:
         raise HTTPException(400, "name is empty after sanitization")
     if z.shape not in _SHAPES:
-        raise HTTPException(400, f"shape must be 'rectangle' or 'polygon'")
+        raise HTTPException(400, "shape must be 'rectangle' or 'polygon'")
     coords = z.coords
     if not coords or not isinstance(coords, list):
         raise HTTPException(400, "coords must be a non-empty list of [x, y] pairs")
+    # Length checks first — prevents iterating huge payloads before rejecting them
+    if z.shape == 'rectangle':
+        if len(coords) != 2:
+            raise HTTPException(400, "rectangle requires exactly 2 points [[x1,y1],[x2,y2]]")
+    else:  # polygon
+        if len(coords) < 3:
+            raise HTTPException(400, "polygon requires at least 3 vertices")
+        if len(coords) > _MAX_VERTS:
+            raise HTTPException(400, f"polygon exceeds maximum of {_MAX_VERTS} vertices")
     for i, pt in enumerate(coords):
         if not isinstance(pt, list) or len(pt) != 2:
             raise HTTPException(400, f"coords[{i}] must be [x, y]")
@@ -278,17 +295,10 @@ def _validate_zone(z: ZoneCreate) -> tuple[str, str]:
         if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
             raise HTTPException(400, f"coords[{i}] [{x}, {y}] is outside [0, 1]")
     if z.shape == 'rectangle':
-        if len(coords) != 2:
-            raise HTTPException(400, "rectangle requires exactly 2 points [[x1,y1],[x2,y2]]")
         x1, y1 = coords[0]
         x2, y2 = coords[1]
         if x1 >= x2 or y1 >= y2:
             raise HTTPException(400, "rectangle: x1 < x2 and y1 < y2 required")
-    else:  # polygon
-        if len(coords) < 3:
-            raise HTTPException(400, "polygon requires at least 3 vertices")
-        if len(coords) > _MAX_VERTS:
-            raise HTTPException(400, f"polygon exceeds maximum of {_MAX_VERTS} vertices")
     return name, json.dumps(coords)
 
 
@@ -337,6 +347,8 @@ def get_events(
 ):
     if start_ms >= end_ms:
         raise HTTPException(status_code=400, detail="start_ms must be less than end_ms")
+    if end_ms - start_ms > _MAX_REPLAY_MS:
+        raise HTTPException(status_code=400, detail="Time range exceeds maximum of 10 minutes (600 000 ms)")
     if limit < 1 or limit > 20_000:
         raise HTTPException(status_code=400, detail="limit must be between 1 and 20000")
     with get_connection() as conn:
@@ -432,13 +444,14 @@ async def ws_replay(
         await websocket.close(code=4400)
         return
 
-    # Load and group all rows by timestamp up front (max ~10 min × 10 Hz × N tracks)
+    # Load and group all rows by timestamp up front (capped to avoid loading unbounded results)
     with get_connection() as conn:
         cur = conn.execute(
             "SELECT ts_ms, track_id, bearing, range_u, heading, rel_speed_u, altitude_m, confidence"
             " FROM track_samples"
             " WHERE ts_ms >= ? AND ts_ms <= ?"
-            " ORDER BY ts_ms",
+            " ORDER BY ts_ms"
+            " LIMIT 50000",
             (start_ms, end_ms),
         )
         cols = [d[0] for d in cur.description]
@@ -481,8 +494,9 @@ async def ws_replay(
         await websocket.send_json({"type": "done", "count": len(timestamps)})
         await websocket.close()
 
-    except Exception:
-        pass  # client disconnected mid-replay
+    except Exception as exc:
+        if not isinstance(exc, WebSocketDisconnect):
+            print(f"[ws_replay] unexpected error: {exc!r}")
 
 
 @app.websocket("/ws/tracks")
@@ -500,3 +514,8 @@ async def ws_tracks(websocket: WebSocket):
             del _pending_events[:]
             await websocket.send_json({"type": "events", "events": batch})
         await asyncio.sleep(0.1)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("app.main:app", host="127.0.0.1", port=8001, reload=False)
