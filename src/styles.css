@@ -39,7 +39,7 @@ a{ color:inherit; text-decoration:none; }
 .shell{
   height:100vh;
   display:grid;
-  grid-template-rows: 64px 1fr 104px;
+  grid-template-rows: 64px 1fr 220px 72px;
 }
 
 .topbar{
@@ -276,6 +276,7 @@ a{ color:inherit; text-decoration:none; }
 .badge.ok{ border-color: rgba(34,197,94,.30); background: rgba(34,197,94,.10); }
 .badge.warn{ border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.12); }
 .badge.bad{ border-color: rgba(239,68,68,.35); background: rgba(239,68,68,.12); }
+.badge.info{ border-color: rgba(56,189,248,.35); background: rgba(56,189,248,.12); }
 .badge .m{ font-family:var(--mono); }
 
 /* Inspector */
@@ -314,12 +315,49 @@ textarea{
 }
 textarea:focus{ border-color: rgba(56,189,248,.35); }
 
+/* Event log section */
+.eventSection{
+  border-top:1px solid var(--border);
+  background: rgba(7,10,16,.55);
+  backdrop-filter: blur(8px);
+  padding: 10px 12px;
+  min-height:0;
+  display:flex;
+  flex-direction:column;
+}
+.eventSectionHeader{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  margin-bottom:8px;
+  flex-shrink:0;
+}
+.eventSectionHeader .title{ font-size:12px; font-weight:750; letter-spacing:.2px; }
+.eventTable{
+  flex:1;
+  overflow:auto;
+  border-radius:14px;
+  border:1px solid rgba(255,255,255,.10);
+  background:rgba(0,0,0,.14);
+  min-height:0;
+}
+.eventTable .table td{ padding:7px 10px; }
+.evtEnter td:first-child{ border-left:2px solid rgba(34,197,94,.55); }
+.evtExit  td:first-child{ border-left:2px solid rgba(245,158,11,.55); }
+.evtDwell td:first-child{ border-left:2px solid rgba(56,189,248,.55); }
+.emptyLog{
+  padding:20px;
+  text-align:center;
+  font-size:12px;
+  color:rgba(159,178,209,.7);
+}
+
 /* Bottom log */
 .bottom{
   border-top:1px solid var(--border);
   background: rgba(11,20,38,.68);
   backdrop-filter: blur(10px);
-  padding: 10px 12px;
+  padding: 8px 12px;
   display:grid;
   grid-template-columns: 1fr 420px;
   gap:12px;
@@ -367,7 +405,7 @@ textarea:focus{ border-color: rgba(56,189,248,.35); }
 
 @media (max-width: 1220px){
   body{ overflow:auto; }
-  .shell{ height:auto; }
+  .shell{ height:auto; grid-template-rows: 64px auto auto auto; }
   .mid{ grid-template-columns: 1fr; }
   .bottom{ grid-template-columns: 1fr; }
   .brand{ min-width: unset; }

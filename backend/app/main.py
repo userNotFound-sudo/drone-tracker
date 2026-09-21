@@ -1,18 +1,22 @@
 import asyncio
+import json
 import math
 import os
 import pathlib
+import re
 import time
 
 import cv2
-from fastapi import FastAPI, HTTPException, Query, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Response, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 from .altitude import AltitudeEstimator, load_config
 from .db import TrackSampleWriter, get_connection, init_db
 from .detector import BlobDetector, YoloDetector
 from .tracker import MultiObjectTracker
+from .zone_engine import ZoneEventEngine
 
 VIDEO_PATH = pathlib.Path(__file__).parent.parent / "data" / "perdix_swarm_demo.mp4"
 
@@ -21,7 +25,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -30,7 +34,40 @@ _current_tracks: list[dict] = []
 _current_media_t_sec: float = 0.0
 _frame_meta: dict = {"frame_w": 1024, "frame_h": 576, "fps": 30}
 
-_writer = TrackSampleWriter()
+_writer        = TrackSampleWriter()
+_zone_engine   = ZoneEventEngine()
+_current_zones: list[dict] = []   # in-memory zone cache, refreshed on every write
+_pending_events: list[dict] = []  # events queued for the next WS send
+
+
+def _refresh_zones() -> None:
+    global _current_zones
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT id, name, shape, coords FROM zones ORDER BY id"
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for row in rows:
+        row["coords"] = json.loads(row["coords"])
+    _current_zones = rows
+
+
+# Radar SVG constants — must match App.jsx (W=680, H=520, radius = min(W,H)/2 - 28)
+_RADAR_W  = 680.0
+_RADAR_H  = 520.0
+_RADAR_CX = _RADAR_W / 2   # 340
+_RADAR_CY = _RADAR_H / 2   # 260
+_RADAR_R  = min(_RADAR_W, _RADAR_H) / 2 - 28  # 232
+
+
+def _radar_norm(bearing: float, range_u: float) -> tuple[float, float]:
+    """Map (bearing °, range_u) to the same [0,1] space as zones drawn on the SVG."""
+    a = math.radians(bearing - 90)
+    rr = _RADAR_R * range_u
+    x = _RADAR_CX + rr * math.cos(a)
+    y = _RADAR_CY + rr * math.sin(a)
+    return x / _RADAR_W, y / _RADAR_H
 
 
 def _pixel_to_radar(cx, cy, frame_w, frame_h):
@@ -143,8 +180,28 @@ async def _video_pipeline():
         tracks = tracker.update(detections)
         _current_tracks = [_build_track(t, frame_w, frame_h, fps, alt_est) for t in tracks]
 
+        ts_ms = int(time.time() * 1000)
+
+        # zone event detection — uses radar SVG-normalised coords to match drawn zones
+        if _current_zones and _current_tracks:
+            track_points = [
+                {"track_id": t["id"], "cx": cx, "cy": cy}
+                for t in _current_tracks
+                for cx, cy in [_radar_norm(t["bearing"], t["range_u"])]
+            ]
+            if track_points:
+                zone_events = _zone_engine.update(track_points, _current_zones, ts_ms)
+                if zone_events:
+                    _pending_events.extend(zone_events)
+                    with get_connection() as conn:
+                        conn.executemany(
+                            "INSERT INTO events (zone_id, ts_ms, event_type, track_id)"
+                            " VALUES (?, ?, ?, ?)",
+                            [(e["zone_id"], e["ts_ms"], e["event_type"], e["track_id"])
+                             for e in zone_events],
+                        )
+
         if frame_index % sample_every == 0:
-            ts_ms = int(time.time() * 1000)
             for t in _current_tracks:
                 _writer.add_sample({
                     "ts_ms":       ts_ms,
@@ -165,6 +222,7 @@ async def _video_pipeline():
 @app.on_event("startup")
 async def startup():
     init_db()
+    _refresh_zones()
     _writer.start()
     asyncio.create_task(_video_pipeline())
 
@@ -187,6 +245,113 @@ def video():
 
 
 _MAX_REPLAY_MS = 10 * 60 * 1000  # 10 minutes
+
+# ---------------------------------------------------------------------------
+# Zones
+# ---------------------------------------------------------------------------
+
+_CTRL_RE   = re.compile(r'[\x00-\x1f\x7f]')
+_SHAPES    = {'rectangle', 'polygon'}
+_MAX_VERTS = 256
+_MAX_NAME  = 128
+
+
+class ZoneCreate(BaseModel):
+    name:   str
+    shape:  str
+    coords: list[list[float]]
+
+
+def _validate_zone(z: ZoneCreate) -> tuple[str, str]:
+    name = _CTRL_RE.sub('', z.name)[:_MAX_NAME].strip()
+    if not name:
+        raise HTTPException(400, "name is empty after sanitization")
+    if z.shape not in _SHAPES:
+        raise HTTPException(400, f"shape must be 'rectangle' or 'polygon'")
+    coords = z.coords
+    if not coords or not isinstance(coords, list):
+        raise HTTPException(400, "coords must be a non-empty list of [x, y] pairs")
+    for i, pt in enumerate(coords):
+        if not isinstance(pt, list) or len(pt) != 2:
+            raise HTTPException(400, f"coords[{i}] must be [x, y]")
+        x, y = pt
+        if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+            raise HTTPException(400, f"coords[{i}] [{x}, {y}] is outside [0, 1]")
+    if z.shape == 'rectangle':
+        if len(coords) != 2:
+            raise HTTPException(400, "rectangle requires exactly 2 points [[x1,y1],[x2,y2]]")
+        x1, y1 = coords[0]
+        x2, y2 = coords[1]
+        if x1 >= x2 or y1 >= y2:
+            raise HTTPException(400, "rectangle: x1 < x2 and y1 < y2 required")
+    else:  # polygon
+        if len(coords) < 3:
+            raise HTTPException(400, "polygon requires at least 3 vertices")
+        if len(coords) > _MAX_VERTS:
+            raise HTTPException(400, f"polygon exceeds maximum of {_MAX_VERTS} vertices")
+    return name, json.dumps(coords)
+
+
+@app.get("/zones")
+def get_zones():
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT id, name, shape, coords, created_ms FROM zones ORDER BY id"
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    for row in rows:
+        row["coords"] = json.loads(row["coords"])
+    return rows
+
+
+@app.post("/zones", status_code=201)
+def create_zone(z: ZoneCreate):
+    name, coords_json = _validate_zone(z)
+    ts_ms = int(time.time() * 1000)
+    with get_connection() as conn:
+        cur = conn.execute(
+            "INSERT INTO zones (name, shape, coords, created_ms) VALUES (?, ?, ?, ?)",
+            (name, z.shape, coords_json, ts_ms),
+        )
+        zone_id = cur.lastrowid
+    _refresh_zones()
+    return {"id": zone_id, "name": name, "shape": z.shape, "coords": z.coords, "created_ms": ts_ms}
+
+
+@app.delete("/zones/{zone_id}", status_code=204)
+def delete_zone(zone_id: int):
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM zones WHERE id = ?", (zone_id,))
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail=f"Zone {zone_id} not found")
+    _refresh_zones()
+    return Response(status_code=204)
+
+
+@app.get("/events")
+def get_events(
+    start_ms: int = Query(...),
+    end_ms:   int = Query(...),
+    limit:    int = Query(1000),
+):
+    if start_ms >= end_ms:
+        raise HTTPException(status_code=400, detail="start_ms must be less than end_ms")
+    if limit < 1 or limit > 20_000:
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 20000")
+    with get_connection() as conn:
+        cur = conn.execute(
+            "SELECT e.id, e.zone_id, z.name AS zone_name,"
+            "       e.ts_ms, e.event_type, e.track_id, e.detail"
+            " FROM events e LEFT JOIN zones z ON e.zone_id = z.id"
+            " WHERE e.ts_ms >= ? AND e.ts_ms <= ?"
+            " ORDER BY e.ts_ms"
+            " LIMIT ?",
+            (start_ms, end_ms, limit),
+        )
+        cols = [d[0] for d in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+    return {"count": len(rows), "events": rows}
 
 
 @app.get("/replay")
@@ -330,4 +495,8 @@ async def ws_tracks(websocket: WebSocket):
             "media_t_sec": _current_media_t_sec,
             "tracks": _current_tracks,
         })
+        if _pending_events:
+            batch = _pending_events[:]
+            del _pending_events[:]
+            await websocket.send_json({"type": "events", "events": batch})
         await asyncio.sleep(0.1)

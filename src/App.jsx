@@ -101,13 +101,21 @@ export default function App(){
   })
   const [wsUrl, setWsUrl] = useState(LIVE_WS_URL)
   const [replayStatus, setReplayStatus] = useState('')
+  const [zoneEventLog, setZoneEventLog] = useState([])  // rolling zone events from backend
+  const [zones, setZones] = useState([])                // zone list for name lookup + radar display
+  const [drawZoneMode, setDrawZoneMode] = useState(false)
+  const [drawRect, setDrawRect] = useState(null)        // {x1,y1,x2,y2} in SVG viewBox units while dragging
 
-  const timerRef      = useRef(null)
-  const videoRef      = useRef(null)
-  const canvasRef     = useRef(null)
-  const frameBuffer   = useRef(new Map())  // media_t_sec -> tracks[]
-  const rafRef        = useRef(null)
-  const lastSyncKey   = useRef(null)
+  const timerRef       = useRef(null)
+  const videoRef       = useRef(null)
+  const canvasRef      = useRef(null)
+  const frameBuffer    = useRef(new Map())  // media_t_sec -> tracks[]
+  const rafRef         = useRef(null)
+  const lastSyncKey    = useRef(null)
+  const eventLogEndRef = useRef(null)
+  const svgRef         = useRef(null)
+  const drawStartRef   = useRef(null)  // SVG coords where drag started
+  const drawCurrRef    = useRef(null)  // current drag rect (avoids stale closure in mouseup)
 
   useEffect(()=>{
     clearInterval(timerRef.current)
@@ -115,6 +123,20 @@ export default function App(){
     timerRef.current = setInterval(()=> setTick(t=>t+1), 250 / speed)
     return ()=> clearInterval(timerRef.current)
   }, [playing, speed])
+
+  function fetchZones() {
+    fetch('http://127.0.0.1:8001/zones')
+      .then(r => r.ok ? r.json() : [])
+      .then(setZones)
+      .catch(()=>{})
+  }
+
+  useEffect(()=>{ fetchZones() }, [])
+
+  // auto-scroll event log to newest entry
+  useEffect(()=>{
+    eventLogEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [zoneEventLog])
 
   useEffect(()=>{
     const BUFFER_SECS = 60
@@ -131,6 +153,11 @@ export default function App(){
           if (k < t - BUFFER_SECS) frameBuffer.current.delete(k)
           else break
         }
+      } else if (msg?.type === 'events' && Array.isArray(msg.events)) {
+        setZoneEventLog(prev => {
+          const next = [...prev, ...msg.events]
+          return next.length > 200 ? next.slice(next.length - 200) : next
+        })
       } else if (msg?.type === 'done') {
         setReplayStatus(`Done · ${msg.count} frames replayed`)
         setWsTracks(null)
@@ -256,6 +283,10 @@ export default function App(){
     return rows
   }, [tracks, clusters, alertCount])
 
+  function zoneName(id) {
+    return zones.find(z => z.id === id)?.name ?? `Zone #${id}`
+  }
+
   function switchToLive() {
     frameBuffer.current.clear()
     setSyncedTracks(null)
@@ -283,6 +314,65 @@ export default function App(){
     setWsUrl(`${REPLAY_WS_BASE}?start_ms=${startMs}&end_ms=${endMs}&rate=${rate}&hz=${hz}`)
   }
 
+  async function exportAAR() {
+    const endMs   = Date.now()
+    const startMs = endMs - 5 * 60 * 1000   // last 5 minutes
+    const BASE    = 'http://127.0.0.1:8001'
+    const nowIso  = new Date(endMs).toISOString()
+
+    const [trackRes, zonesRes, eventsRes] = await Promise.allSettled([
+      fetch(`${BASE}/replay?start_ms=${startMs}&end_ms=${endMs}&limit=20000`),
+      fetch(`${BASE}/zones`),
+      fetch(`${BASE}/events?start_ms=${startMs}&end_ms=${endMs}&limit=20000`),
+    ])
+
+    async function safeJson(settled, fallback) {
+      if (settled.status !== 'fulfilled' || !settled.value.ok) return fallback
+      try { return await settled.value.json() } catch { return fallback }
+    }
+
+    const [trackData, zonesData, eventsData] = await Promise.all([
+      safeJson(trackRes,  { count: 0, rows: [] }),
+      safeJson(zonesRes,  []),
+      safeJson(eventsRes, { count: 0, events: [] }),
+    ])
+
+    const aar = {
+      meta: {
+        generated_at:       nowIso,
+        generated_by:       'JROTC Swarm Tactical Console',
+        version:            '1.0',
+        window_start_iso:   new Date(startMs).toISOString(),
+        window_end_iso:     new Date(endMs).toISOString(),
+        window_start_ms:    startMs,
+        window_end_ms:      endMs,
+        window_duration_s:  Math.round((endMs - startMs) / 1000),
+        active_tracks:      tracks.length,
+        flagged_tracks:     alertCount,
+      },
+      tracks: {
+        count:   trackData.count,
+        samples: trackData.rows,
+      },
+      zones: zonesData,
+      events: {
+        count: eventsData.count,
+        items: eventsData.events,
+      },
+      commander_notes: notesById,
+    }
+
+    const blob = new Blob([JSON.stringify(aar, null, 2)], { type: 'application/json' })
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
+    a.download = `aar-${nowIso.replace(/:/g, '-').replace(/\./g, '-')}.json`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }
+
   const rewind = ()=> setTick(v=> Math.max(0, v-12))
   const stepBack = ()=> setTick(v=> Math.max(0, v-1))
   const stepFwd = ()=> setTick(v=> v+1)
@@ -291,6 +381,56 @@ export default function App(){
   const W=680, H=520
   const cx=W/2, cy=H/2
   const radius=Math.min(W,H)/2 - 28
+
+  // Convert a mouse event to SVG viewBox coordinates
+  function svgCoords(e) {
+    const svg = svgRef.current
+    if (!svg) return { x: 0, y: 0 }
+    const r = svg.getBoundingClientRect()
+    return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H }
+  }
+
+  function handleSvgMouseDown(e) {
+    if (!drawZoneMode) return
+    e.preventDefault()
+    const p = svgCoords(e)
+    drawStartRef.current = p
+    drawCurrRef.current = { x1: p.x, y1: p.y, x2: p.x, y2: p.y }
+    setDrawRect(drawCurrRef.current)
+  }
+
+  function handleSvgMouseMove(e) {
+    if (!drawStartRef.current) return
+    const p = svgCoords(e)
+    const s = drawStartRef.current
+    const r = { x1: Math.min(s.x, p.x), y1: Math.min(s.y, p.y), x2: Math.max(s.x, p.x), y2: Math.max(s.y, p.y) }
+    drawCurrRef.current = r
+    setDrawRect(r)
+  }
+
+  function handleSvgMouseUp(e) {
+    if (!drawStartRef.current) return
+    drawStartRef.current = null
+    const dr = drawCurrRef.current
+    drawCurrRef.current = null
+    setDrawRect(null)
+    if (!dr || dr.x2 - dr.x1 < 8 || dr.y2 - dr.y1 < 8) return
+
+    const coords = [
+      [parseFloat((dr.x1 / W).toFixed(4)), parseFloat((dr.y1 / H).toFixed(4))],
+      [parseFloat((dr.x2 / W).toFixed(4)), parseFloat((dr.y2 / H).toFixed(4))],
+    ]
+    const name = window.prompt('Zone name:')
+    if (!name || !name.trim()) return
+
+    fetch('http://127.0.0.1:8001/zones', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: name.trim(), shape: 'rectangle', coords }),
+    })
+      .then(r => { if (r.ok) fetchZones() })
+      .catch(() => {})
+  }
 
   const ringEls = []
   for (let i=1;i<=rings;i++){
@@ -336,7 +476,7 @@ export default function App(){
           <button className="btn primary" onClick={()=>setPlaying(p=>!p)}>{playing ? 'Pause' : 'Play'}</button>
           <button className="btn" onClick={rewind}>⟲ Rewind</button>
           <button className="btn" onClick={fastFwd}>Fast ⟳</button>
-          <button className="btn" onClick={()=>alert('Prototype export: wire this to PDF/JSON AAR later.')}>Export AAR</button>
+          <button className="btn" onClick={exportAAR}>Export AAR</button>
         </div>
       </div>
 
@@ -390,6 +530,14 @@ export default function App(){
             <div style={{ display:'flex', gap:6, alignItems:'center', marginBottom:8, flexWrap:'wrap' }}>
               <button className={`btn${mode==='live'?' primary':''}`} onClick={switchToLive}>LIVE</button>
               <button className={`btn${mode==='replay'?' primary':''}`} onClick={()=>setMode('replay')}>REPLAY</button>
+              <button
+                className={`btn${drawZoneMode ? ' bad' : ''}`}
+                onClick={() => setDrawZoneMode(v => !v)}
+                title="Click and drag on the radar to define a zone"
+              >
+                {drawZoneMode ? '✕ Cancel Draw' : '⬚ Draw Zone'}
+              </button>
+              {drawZoneMode && <span className="small" style={{ color:'rgba(245,158,11,.9)' }}>Click &amp; drag to draw a rectangle</span>}
               {mode === 'replay' && (<>
                 <input
                   type="datetime-local"
@@ -429,7 +577,16 @@ export default function App(){
             </div>
 
             <div className="radarWrap">
-              <svg className="radarSvg" viewBox={`0 0 ${W} ${H}`}>
+              <svg
+                ref={svgRef}
+                className="radarSvg"
+                viewBox={`0 0 ${W} ${H}`}
+                style={{ cursor: drawZoneMode ? 'crosshair' : 'default' }}
+                onMouseDown={handleSvgMouseDown}
+                onMouseMove={handleSvgMouseMove}
+                onMouseUp={handleSvgMouseUp}
+                onMouseLeave={handleSvgMouseUp}
+              >
                 {/* Base circle + rings */}
                 <circle cx={cx} cy={cy} r={radius} stroke="rgba(255,255,255,.22)" fill="none" />
                 {ringEls.map((el, idx)=>{
@@ -443,6 +600,28 @@ export default function App(){
                 {/* Sweep wedge */}
                 <path d={`M ${cx} ${cy} L ${cx} ${cy-radius} A ${radius} ${radius} 0 0 1 ${cx + radius*0.35} ${cy - radius*0.94} Z`}
                       fill="rgba(34,197,94,.10)" />
+
+                {/* Saved zones */}
+                {zones.filter(z => z.shape === 'rectangle').map(z => {
+                  const [[x1n, y1n], [x2n, y2n]] = z.coords
+                  const zx = x1n * W, zy = y1n * H
+                  const zw = (x2n - x1n) * W, zh = (y2n - y1n) * H
+                  return (
+                    <g key={z.id}>
+                      <rect x={zx} y={zy} width={zw} height={zh}
+                            fill="rgba(56,189,248,.06)"
+                            stroke="rgba(56,189,248,.50)"
+                            strokeWidth={1.5}
+                            strokeDasharray="5 3"
+                            rx={3} />
+                      <text x={zx + 5} y={zy + 14} fontSize="11"
+                            fill="rgba(56,189,248,.85)"
+                            style={{ pointerEvents:'none', userSelect:'none' }}>
+                        {z.name}
+                      </text>
+                    </g>
+                  )
+                })}
 
                 {/* Tracks */}
                 {tracks.map(tr=>{
@@ -458,7 +637,9 @@ export default function App(){
                               : 'rgba(34,197,94,.95)'
 
                   return (
-                    <g key={tr.id} style={{ cursor:'pointer' }} onClick={()=>setSelectedId(tr.id)}>
+                    <g key={tr.id}
+                       style={{ cursor: drawZoneMode ? 'crosshair' : 'pointer' }}
+                       onClick={()=>{ if (!drawZoneMode) setSelectedId(tr.id) }}>
                       {showVectors ? (
                         <line x1={p.x} y1={p.y} x2={v.x} y2={v.y}
                               stroke={isSel ? 'rgba(56,189,248,.95)' : 'rgba(255,255,255,.22)'} strokeWidth={isSel ? 2 : 1} />
@@ -474,6 +655,20 @@ export default function App(){
 
                 {/* Center */}
                 <circle cx={cx} cy={cy} r="4" fill="rgba(34,197,94,.95)" />
+
+                {/* Active draw rectangle */}
+                {drawRect && (
+                  <rect
+                    x={drawRect.x1} y={drawRect.y1}
+                    width={drawRect.x2 - drawRect.x1} height={drawRect.y2 - drawRect.y1}
+                    fill="rgba(245,158,11,.10)"
+                    stroke="rgba(245,158,11,.80)"
+                    strokeWidth={1.5}
+                    strokeDasharray="4 3"
+                    rx={3}
+                    style={{ pointerEvents:'none' }}
+                  />
+                )}
               </svg>
 
               <div className="legendRow">
@@ -592,6 +787,70 @@ export default function App(){
         </div>
       </div>
 
+      {/* Zone Event Log */}
+      <div className="eventSection">
+        <div className="eventSectionHeader">
+          <div className="title">Zone Event Log</div>
+          <div style={{ display:'flex', gap:10, alignItems:'center' }}>
+            <span className="small">{zoneEventLog.length} event{zoneEventLog.length !== 1 ? 's' : ''}</span>
+            {zoneEventLog.length > 0 && (
+              <button className="btn" style={{ padding:'3px 10px', fontSize:11 }}
+                onClick={() => setZoneEventLog([])}>Clear</button>
+            )}
+          </div>
+        </div>
+
+        <div className="eventTable">
+          {zoneEventLog.length === 0 ? (
+            <div className="emptyLog">No zone events yet — define a zone via POST /zones to begin tracking.</div>
+          ) : (
+            <table className="table">
+              <thead>
+                <tr>
+                  <th>Time (UTC)</th>
+                  <th>Track</th>
+                  <th>Zone</th>
+                  <th>Event</th>
+                  <th>Details</th>
+                </tr>
+              </thead>
+              <tbody>
+                {zoneEventLog.map((e, idx) => {
+                  const evtClass = e.event_type === 'ENTER' ? 'ok'
+                                 : e.event_type === 'EXIT'  ? 'warn'
+                                 : 'info'
+                  const rowClass = e.event_type === 'ENTER' ? 'evtEnter'
+                                 : e.event_type === 'EXIT'  ? 'evtExit'
+                                 : 'evtDwell'
+                  const detail   = e.event_type === 'ENTER' ? 'entered boundary'
+                                 : e.event_type === 'EXIT'  ? 'departed boundary'
+                                 : '≥55 s continuous presence'
+                  return (
+                    <tr key={idx} className={rowClass}>
+                      <td style={{ fontFamily:'var(--mono)', whiteSpace:'nowrap' }}>
+                        {new Date(e.ts_ms).toISOString().slice(11, 19)}Z
+                      </td>
+                      <td style={{ fontFamily:'var(--mono)' }}>
+                        UAV-{String(e.track_id).padStart(2, '0')}
+                      </td>
+                      <td>{zoneName(e.zone_id)}</td>
+                      <td>
+                        <span className={`badge ${evtClass}`}>
+                          <span className="m">{e.event_type}</span>
+                        </span>
+                      </td>
+                      <td className="small">{detail}</td>
+                    </tr>
+                  )
+                })}
+                <tr ref={eventLogEndRef} />
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* Bottom strip — operational snapshot */}
       <div className="bottom">
         <div className="log">
           {logRows.map((r, idx)=> (
@@ -603,7 +862,7 @@ export default function App(){
         </div>
 
         <div className="rightMini">
-          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
             <div style={{ fontSize:12, fontWeight:800 }}>Operational Snapshot</div>
             <div className="small">Training mode</div>
           </div>
@@ -611,10 +870,6 @@ export default function App(){
             <div className="k"><div className="l">Tracks</div><div className="n">{tracks.length}</div></div>
             <div className="k"><div className="l">Flagged</div><div className="n">{alertCount}</div></div>
             <div className="k"><div className="l">Clusters</div><div className="n">{clusters.length}</div></div>
-          </div>
-
-          <div style={{ marginTop: 10 }} className="small">
-            UX pillars: calm legibility • commander truthfulness • cadet learning loops • AAR ready.
           </div>
         </div>
       </div>

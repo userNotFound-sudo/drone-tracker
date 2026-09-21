@@ -49,6 +49,34 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_track_samples_ts_ms
             ON track_samples (ts_ms)
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS zones (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL,
+                shape       TEXT NOT NULL,
+                coords      TEXT NOT NULL,
+                created_ms  INTEGER NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS events (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                zone_id     INTEGER REFERENCES zones(id) ON DELETE CASCADE,
+                ts_ms       INTEGER NOT NULL,
+                event_type  TEXT NOT NULL,
+                track_id    INTEGER,
+                detail      TEXT
+            )
+        """)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_ts_ms
+            ON events (ts_ms)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_zone_id
+            ON events (zone_id)
+        """)
 
 
 class TrackSampleWriter:
